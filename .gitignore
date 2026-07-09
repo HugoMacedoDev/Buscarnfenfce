@@ -17,3 +17,9 @@ scratch/
 Sem Procuracao/
 siga_nfc_detalhes_*/
 
+# --- Certificados ---
+*.pfx
+*.pem
+*.crt
+*.key
+certificados/
