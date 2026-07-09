@@ -5,6 +5,7 @@ config.json
 # --- Arquivos temporários do Python ---
 __pycache__/
 *.pyc
+scratch/
 
 # --- Arquivos de dados grandes ---
 *.zip

@@ -251,7 +251,7 @@ def processar_lote_xml(lote, api_token, thread_id):
     
     for task in lote:
         chave, company_label, date_subfolder = task
-        folder = os.path.join(f"{company_label}-", date_subfolder)
+        folder = os.path.join("siga_nfce", f"{company_label}-", date_subfolder)
         filepath = os.path.join(folder, f"{chave}.xml")
         
         # Ignora se já foi baixado anteriormente
@@ -496,7 +496,7 @@ def main():
         if sem_procuracao_detected:
             print("❌ Sem procuração! (Adicionado na pasta 'Sem Procuracao')")
             # Salvar o aviso numa pasta diferente
-            folder_sem = "Sem Procuracao"
+            folder_sem = os.path.join("siga_nfce", "Sem Procuracao")
             os.makedirs(folder_sem, exist_ok=True)
             filepath_sem = os.path.join(folder_sem, f"{company_label}.txt")
             with open(filepath_sem, "w", encoding="utf-8") as f_sem:
@@ -512,10 +512,11 @@ def main():
     # 7. Filtro de XMLs faltantes
     baixados = []
     print("\n🔍 Escaneando diretórios locais para verificar arquivos já baixados...")
-    for root, dirs, files in os.walk("."):
-        for name in files:
-            if name.endswith(".xml"):
-                baixados.append(name.replace(".xml", ""))
+    if os.path.exists("siga_nfce"):
+        for root, dirs, files in os.walk("siga_nfce"):
+            for name in files:
+                if name.endswith(".xml"):
+                    baixados.append(name.replace(".xml", ""))
                 
     print(f"ℹ️ Total de XMLs locais identificados: {len(baixados)}")
     

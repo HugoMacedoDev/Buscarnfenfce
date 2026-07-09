@@ -19,12 +19,26 @@ Este repositório contém um conjunto de ferramentas em Python para automação 
 * Organiza os arquivos de saída em pastas bem estruturadas: `[CÓDIGO/CNPJ] - [NOME_EMPRESA]/MMAAAA/`.
 * Compacta automaticamente os XMLs baixados em arquivos ZIP individuais para cada empresa.
 
+### 3. Extrator de NF-e XLSX (`nfe_xlsx_extractor.py`)
+* Automatiza a geração e o download de planilhas XLSX contendo todas as chaves de **NF-e** das empresas.
+* Dá suporte a ambas as modalidades: **Emissor** (saídas) e **Destinatário** (entradas).
+* Verifica se a solicitação de exportação já existe para evitar reprocessamentos desnecessários (erro 409).
+* Monitora o processamento da SEFAZ até que o arquivo esteja pronto para download e salva-o estruturadamente na pasta de cada empresa.
+
+### 4. Coletor de XMLs de NF-e (`nfe_xml_downloader.py`)
+* Escaneia e identifica certificados digitais A1 (`.pfx` ou `.p12`) salvos na raiz do diretório.
+* Lê as chaves de acesso diretamente das planilhas XLSX geradas no passo anterior.
+* Conecta via SOAP ao WebService oficial da SEFAZ Nacional utilizando o certificado correspondente e baixa os XMLs das NF-e.
+* Salva os arquivos XML completos diretamente na pasta do respectivo mês de cada empresa.
+
 ---
 
 ## 📂 Estrutura de Arquivos
 
 *   `siga_extractor.py`: Script para extração da lista de empresas e monitoramento de tokens.
 *   `nfc_extractor.py`: Script de download multithread e compactação das NFC-es.
+*   `nfe_xlsx_extractor.py`: Script para download automatizado de relatórios XLSX de NF-e (Emissor e Destinatário).
+*   `nfe_xml_downloader.py`: Script para download dos XMLs completos das NF-e utilizando os certificados A1.
 *   `config.json`: Cache local das configurações de conexão e tokens OAuth2 (ignorado pelo Git).
 *   `api_token.txt`: Token de autorização ativo para as requisições à API da SEFAZ (ignorado pelo Git).
 *   `empresas cod.xlsx`: Planilha com os códigos e identificadores internos das empresas.
@@ -64,6 +78,16 @@ python siga_extractor.py
 Para extrair e compilar os XMLs de NFC-e:
 ```bash
 python nfc_extractor.py
+```
+
+Para baixar as planilhas XLSX das NF-e (Emissor e Destinatário):
+```bash
+python nfe_xlsx_extractor.py
+```
+
+Para baixar os XMLs completos das NF-e usando os certificados A1:
+```bash
+python nfe_xml_downloader.py
 ```
 
 ---
