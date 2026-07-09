@@ -1,0 +1,18 @@
+# --- Credenciais e Segurança ---
+api_token.txt
+config.json
+
+# --- Arquivos temporários do Python ---
+__pycache__/
+*.pyc
+
+# --- Arquivos de dados grandes ---
+*.zip
+*.xlsx
+*.csv
+
+# --- Pastas de dados de empresas (baixadas e futuras) ---
+[0-9]*/
+Sem Procuracao/
+siga_nfc_detalhes_*/
+
