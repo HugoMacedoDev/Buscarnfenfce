@@ -1,99 +1,128 @@
-# SIGA SEFAZ-CE - Extrator de Contribuintes e NFC-e
+# SIGA SEFAZ-CE - Automação Fiscal e Extrator de NFC-e / NF-e
 
-Este repositório contém um conjunto de ferramentas em Python para automação e extração de dados do portal **SIGA da SEFAZ-CE** (Secretaria da Fazenda do Estado do Ceará), com suporte a renovação automática de sessão, download em massa multithread de XMLs fiscais de NFC-e (Nota Fiscal de Consumidor Eletrônica), estruturação de pastas e compactação automática em arquivos ZIP.
+Este repositório contém uma suíte de ferramentas em Python para automação, consulta e extração de documentos fiscais eletrônicos diretamente do portal **SIGA da SEFAZ-CE** (Secretaria da Fazenda do Estado do Ceará), com suporte a renovação automática de autenticação OAuth2, download multithread de XMLs, deduplicação por histórico prévio, geração de planilhas e auditoria de execuções.
 
 ---
 
-## 🛠️ Funcionalidades Principais
+## Ferramentas e Funcionalidades
 
 ### 1. Extrator de Contribuintes (`siga_extractor.py`)
-* Realiza a extração automatizada de todas as empresas do painel do SIGA.
-* Gerencia a expiração do token de acesso de 300 segundos, realizando a **renovação automática** (`refresh_token`) via OAuth2/Keycloak da SEFAZ-CE em segundo plano.
-* Salva os resultados estruturados em um arquivo CSV (`siga_empresas.csv`).
+* Consulta paginada de todas as empresas e estabelecimentos vinculados no painel do SIGA.
+* Gerenciamento de sessão com **renovação automática do token** (`refresh_token`) via Keycloak/OAuth2 da SEFAZ-CE.
+* Gera o arquivo estruturado `siga_empresas.csv` contendo Razão Social, CNPJ, CGF e dados cadastrais.
 
-### 2. Extrator de NFC-e (`nfc_extractor.py`)
-* Coleta chaves de acesso detalhadas das NFC-e no SIGA para o mês selecionado.
-* Associa os dados com os códigos internos das empresas a partir de uma planilha auxiliar (`empresas cod.xlsx`).
-* Realiza o **download multithread de alta performance** (configurado para 40 threads paralelas) dos XMLs fiscais diretamente da SEFAZ.
-* Limpa os namespaces dos XMLs para facilitar manipulações futuras.
-* Organiza os arquivos de saída em pastas bem estruturadas: `[CÓDIGO/CNPJ] - [NOME_EMPRESA]/MMAAAA/`.
-* Compacta automaticamente os XMLs baixados em arquivos ZIP individuais para cada empresa.
+### 2. Extrator e Baixador de NFC-e (`nfc_extractor.py`)
+* **Consulta de Chaves de NFC-e**: Coleta as chaves de acesso das NFC-e emitidas para o mês/ano selecionado.
+* **Filtro de Documentos Cancelados**: Configuração flexível por empresa para incluir ou ignorar notas fiscais canceladas.
+* **Controle Inteligente de Histórico (Chaves Cadastradas)**:
+  * Lê a base de chaves já existentes a partir de `chaves_ja_cadastradas.csv` (ou `chaves_ja_baixadas.csv`) em modo somente leitura (*read-only*).
+  * Reconhece arquivos com ou sem cabeçalho, com 2 colunas (`CNPJ, CHAVE`) ou apenas 1 coluna (`CHAVE`), extraindo automaticamente o CNPJ do emitente contido na própria chave (posições 7 a 20).
+  * Compara e filtra as chaves em memória **especificamente por CNPJ**, evitando downloads duplicados e economizando requisições.
+* **Divisão em Lotes (Partes de até 4.000 XMLs)**:
+  * Agrupa as chaves pendentes de cada empresa em lotes de até 4.000 arquivos (ex: `NFCe_Parte_1`, `NFCe_Parte_2`, etc.).
+* **Download Multithread de Alta Performance**:
+  * Realiza o download paralelo dos XMLs utilizando até 40 threads simultâneas.
+  * Remove namespaces dos XMLs para simplificar a leitura por sistemas ERPs e bancos de dados.
+* **Auditoria de Execução**:
+  * Registra todas as chaves processadas no arquivo `chaves_baixadas_nesta_execucao.csv`.
+* **Tratamento de Empresas Sem Procuração**:
+  * Identifica bloqueios de permissão (HTTP 403) e gera relatórios automáticos na pasta `Sem Procuracao/`.
+* **Resumo Consolidado**:
+  * Ao final, exibe um painel analítico por empresa e o balanço total (chaves no SIGA, já existentes, novas identificadas, baixadas e falhas).
 
-### 3. Extrator de NF-e XLSX (`nfe_xlsx_extractor.py`)
-* Automatiza a geração e o download de planilhas XLSX contendo todas as chaves de **NF-e** das empresas.
-* Dá suporte a ambas as modalidades: **Emissor** (saídas) e **Destinatário** (entradas).
-* Verifica se a solicitação de exportação já existe para evitar reprocessamentos desnecessários (erro 409).
-* Monitora o processamento da SEFAZ até que o arquivo esteja pronto para download e salva-o estruturadamente na pasta de cada empresa.
+### 3. Extrator de NF-e em Excel (`nfe_xlsx_extractor.py`)
+* Consulta direta via API paginada das **NF-e (modelo 55)** para os tipos de operação:
+  * **Saída / Emissor**
+  * **Entrada / Destinatário**
+* Compila os registros em planilhas Excel (`.xlsx`) formatadas com os campos oficiais da SEFAZ (CNPJ/Razão Social, UF, Número da Nota, Data de Emissão, Status de Processamento, Valor R$ e Chave de Acesso).
+* Salva os arquivos organizados na pasta de cada empresa e mês correspondente.
 
-### 4. Coletor de XMLs de NF-e (`nfe_xml_downloader.py`)
-* Escaneia e identifica certificados digitais A1 (`.pfx` ou `.p12`) salvos na raiz do diretório.
-* Lê as chaves de acesso diretamente das planilhas XLSX geradas no passo anterior.
-* Conecta via SOAP ao WebService oficial da SEFAZ Nacional utilizando o certificado correspondente e baixa os XMLs das NF-e.
-* Salva os arquivos XML completos diretamente na pasta do respectivo mês de cada empresa.
-
----
-
-## 📂 Estrutura de Arquivos
-
-*   `siga_extractor.py`: Script para extração da lista de empresas e monitoramento de tokens.
-*   `nfc_extractor.py`: Script de download multithread e compactação das NFC-es.
-*   `nfe_xlsx_extractor.py`: Script para download automatizado de relatórios XLSX de NF-e (Emissor e Destinatário).
-*   `nfe_xml_downloader.py`: Script para download dos XMLs completos das NF-e utilizando os certificados A1.
-*   `config.json`: Cache local das configurações de conexão e tokens OAuth2 (ignorado pelo Git).
-*   `api_token.txt`: Token de autorização ativo para as requisições à API da SEFAZ (ignorado pelo Git).
-*   `empresas cod.xlsx`: Planilha com os códigos e identificadores internos das empresas.
-*   `.gitignore`: Arquivo para evitar o rastreamento de chaves de API, tokens, bancos de dados temporários e dados baixados locais.
+### 4. Coletor de XMLs de NF-e via WebService (`nfe_xml_downloader.py`)
+* Identifica certificados digitais A1 (`.pfx` / `.p12`) salvos no diretório.
+* Lê as chaves de acesso das planilhas Excel geradas pelo `nfe_xlsx_extractor.py`.
+* Realiza a comunicação SOAP segura com os WebServices da SEFAZ Nacional para baixar os XMLs completos das NF-e.
 
 ---
 
-## 🚀 Como Configurar e Executar
+## Estrutura do Projeto
 
-### Pré-requisitos
-*   Python 3.10 ou superior
-*   Bibliotecas adicionais:
-    ```bash
-    pip install requests openpyxl
-    ```
+```text
+├── nfc_extractor.py                   # Script principal de extração e download multithread de NFC-e
+├── nfe_xlsx_extractor.py              # Extrator de relatórios de NF-e em formato Excel (.xlsx)
+├── nfe_xml_downloader.py              # Download de XMLs de NF-e via certificado digital A1
+├── siga_extractor.py                  # Extrator do cadastro geral de empresas vinculadas
+├── empresas cod.xlsx                  # Planilha com o mapeamento e códigos internos das empresas
+├── chaves_ja_cadastradas.csv          # Histórico de chaves já salvas no banco (somente leitura)
+├── chaves_baixadas_nesta_execucao.csv # Registro/auditoria das chaves baixadas na execução atual
+├── siga_empresas.csv                  # Lista exportada de empresas obtidas pelo siga_extractor.py
+├── api_token.txt                      # Token JWT ativo da SEFAZ (ignorado pelo Git)
+├── config.json                        # Configurações de autenticação e endpoints OAuth2 (ignorado pelo Git)
+├── requirements.txt                   # Dependências do projeto
+├── siga_nfce/                         # Diretório onde os XMLs de NFC-e são salvos e organizados
+│   └── [EMPRESA_COD_NOME]/
+│       └── [MMAAAA]/
+│           ├── NFCe_Parte_1/
+│           │   └── *.xml
+│           └── NFCe_Parte_2/
+│               └── *.xml
+└── Sem Procuracao/                    # Relatório de empresas sem autorização ativa na SEFAZ
+```
 
-### Configuração
-1.  Obtenha os dados de acesso e configure o arquivo `config.json` na raiz do projeto:
-    ```json
-    {
-      "access_token": "SEU_ACCESS_TOKEN",
-      "refresh_token": "SEU_REFRESH_TOKEN",
-      "client_id": "painelind-frontend",
-      "token_url": "https://sso.sefaz.ce.gov.br/auth/realms/sefaz-ad-realm/protocol/openid-connect/token",
-      "api_url": "https://siga.sefaz.ce.gov.br/api/v1/unidades-resumo-malha"
-    }
-    ```
-2.  Insira o token de autenticação no arquivo `api_token.txt`.
-3.  Garanta que a planilha `empresas cod.xlsx` esteja preenchida com as empresas a extrair.
+---
 
-### Execução
-Para extrair a lista de empresas do painel do SIGA:
+## Instalação e Configuração
+
+### 1. Pré-requisitos
+* **Python 3.10** ou superior instalado.
+* Instale as dependências executando:
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Configuração de Credenciais
+Crie ou configure o arquivo `config.json` na raiz do projeto com as credenciais do SIGA:
+```json
+{
+  "access_token": "SEU_ACCESS_TOKEN",
+  "refresh_token": "SEU_REFRESH_TOKEN",
+  "client_id": "painelind-frontend",
+  "token_url": "https://sso.sefaz.ce.gov.br/auth/realms/sefaz-ad-realm/protocol/openid-connect/token",
+  "api_url": "https://siga.sefaz.ce.gov.br/api/v1/unidades-resumo-malha"
+}
+```
+
+Insira também o token de autenticação ativo no arquivo `api_token.txt`.
+
+### 3. Planilha de Empresas
+Preencha a planilha `empresas cod.xlsx` com os códigos, CNPJs e nomes das empresas que deseja processar.
+
+---
+
+## Como Executar
+
+### Extrair cadastro de empresas:
 ```bash
 python siga_extractor.py
 ```
 
-Para extrair e compilar os XMLs de NFC-e:
+### Extrair e baixar XMLs de NFC-e (com deduplicação e multithread):
 ```bash
 python nfc_extractor.py
 ```
 
-Para baixar as planilhas XLSX das NF-e (Emissor e Destinatário):
+### Extrair relatórios de NF-e em Excel (Saídas e Entradas):
 ```bash
 python nfe_xlsx_extractor.py
 ```
 
-Para baixar os XMLs completos das NF-e usando os certificados A1:
+### Baixar XMLs de NF-e com Certificado Digital A1:
 ```bash
 python nfe_xml_downloader.py
 ```
 
 ---
 
-## 🛡️ Segurança e LGPD
+## Segurança e LGPD
 
-Este repositório possui regras estritas no arquivo `.gitignore` para assegurar que:
-1.  Nenhum token ou chave de API seja exposto publicamente (`api_token.txt` e `config.json` são ignorados).
-2.  Os dados fiscais e cadastrais extraídos das empresas **permaneçam apenas localmente** na sua máquina e nunca sejam commitados para o repositório público do GitHub.
+* Os arquivos com tokens, chaves de autenticação e caches locais (`api_token.txt`, `config.json`) estão configurados no `.gitignore` e **nunca são enviados ao repositório**.
+* Os arquivos fiscais e XMLs baixados permanecem armazenados estritamente na máquina local.

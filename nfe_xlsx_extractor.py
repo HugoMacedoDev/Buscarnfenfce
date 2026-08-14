@@ -213,51 +213,6 @@ def find_company_code(razao_social, mapping):
                 
     return "", ""
 
-def get_existing_solicitation(session, headers, cnpj, ref_date, doc_type, tipo_operacao):
-    """Busca se já existe uma solicitação com as características desejadas na fila do SIGA."""
-    url = "https://siga.sefaz.ce.gov.br/api/v1/solicitacoes"
-    params = {
-        'size': 1000,
-        'sort': 'criacao,desc'
-    }
-    try:
-        response = session.get(url, headers=headers, params=params, timeout=20)
-        if response.status_code == 200:
-            data = response.json()
-            items = data if isinstance(data, list) else data.get("data", [])
-            for item in items:
-                if item.get("cnpj") == cnpj and item.get("tipo") == doc_type:
-                    if doc_type == "NF_E":
-                        filtro = item.get("filtro", {})
-                        if (filtro.get("datReferencia") == [ref_date] and 
-                            filtro.get("tipoOperacao") == tipo_operacao and 
-                            filtro.get("formatoArquivo") == "xlsx"):
-                            return item
-                    else: # NFC_E
-                        # Para NFC-e, como o filtro vem vazio do backend do SIGA,
-                        # nós retornamos a mais recente encontrada para este CNPJ (o primeiro match)
-                        return item
-    except Exception as e:
-        print(f"\n⚠️ Erro ao consultar lista de solicitações: {e}")
-    return None
-
-def download_file(session, headers, sol_id, dest_filepath):
-    """Realiza o download da planilha XLSX a partir do ID da solicitação concluída."""
-    url = f"https://siga.sefaz.ce.gov.br/api/v1/solicitacoes/{sol_id}/download"
-    try:
-        r = session.get(url, headers=headers, timeout=60)
-        if r.status_code == 200:
-            # Garante a criação da pasta antes de escrever
-            os.makedirs(os.path.dirname(dest_filepath), exist_ok=True)
-            with open(dest_filepath, "wb") as f:
-                f.write(r.content)
-            return True
-        else:
-            print(f"\n❌ Erro HTTP ao fazer download ({r.status_code}): {r.text}")
-    except Exception as e:
-        print(f"\n❌ Erro durante o download do arquivo: {e}")
-    return False
-
 def main():
     print("=" * 60)
     print("     SIGA SEFAZ-CE - COLETOR DE PLANILHAS NF-E (XLSX)")
@@ -313,15 +268,31 @@ def main():
         cnpjs_filtrar = ["".join(filter(str.isdigit, c)) for c in cnpjs_encontrados]
         
         if cnpjs_filtrar:
-            filtradas = []
+            mapa_siga = {}
             for comp in siga_companies:
                 cnpj_comp = "".join(filter(str.isdigit, comp.get("cnpj", "")))
-                if any(f in cnpj_comp for f in cnpjs_filtrar):
-                    filtradas.append(comp)
+                if cnpj_comp:
+                    mapa_siga[cnpj_comp] = comp
+            
+            filtradas = []
+            novos = 0
+            vistos = set()
+            for c in cnpjs_filtrar:
+                if c in vistos:
+                    continue
+                vistos.add(c)
+                if c in mapa_siga:
+                    filtradas.append(mapa_siga[c])
+                else:
+                    filtradas.append({"cnpj": c, "razaoSocial": "", "cgf": ""})
+                    novos += 1
             
             if filtradas:
                 siga_companies = filtradas
-                print(f"🎯 Filtrado! {len(siga_companies)} empresa(s) selecionada(s) para processar.")
+                if novos > 0:
+                    print(f"🎯 Total: {len(siga_companies)} empresa(s) selecionada(s) ({len(siga_companies) - novos} da base salva + {novos} CNPJ(s) adicionados diretamente).")
+                else:
+                    print(f"🎯 Filtrado! {len(siga_companies)} empresa(s) selecionada(s) para processar.")
             else:
                 print("⚠️ Nenhuma empresa correspondente encontrada. Usando a lista completa.")
         else:
@@ -347,14 +318,19 @@ def main():
         if not cnpj_clean:
             continue
             
-        cod_excel, nome_excel = find_company_code(razao_social, excel_mapping)
-        company_label = f"{cod_excel} - {nome_excel}" if cod_excel else f"{cnpj_clean} - {razao_social}"
+        cod_excel, nome_excel = find_company_code(razao_social, excel_mapping) if razao_social else ("", "")
+        if cod_excel:
+            company_label = f"{cod_excel} - {nome_excel}"
+        elif razao_social:
+            company_label = f"{cnpj_clean} - {razao_social}"
+        else:
+            company_label = f"{cnpj_clean}"
         company_label = sanitize_filename(company_label)
         
         # Estrutura de pasta padrão: pasta-/[MMAAAA]/
         folder = os.path.join(f"{company_label}-", date_subfolder)
         
-        print(f"\n⏳ [{idx+1}/{len(siga_companies)}] Processando: {company_label}")
+        print(f"\n⏳ [{idx+1}/{len(siga_companies)}] Processando CNPJ {cnpj_clean} - {company_label}")
         
         # Configuração de tipos de documentos e operações
         jobs = []
@@ -375,6 +351,7 @@ def main():
             op_label = job["label"]
             api_path = job["api_path"]
             
+            # Ambos NF-e e NFC-e são salvos como planilhas Excel compiladas localmente
             filepath = os.path.join(folder, f"{op_label}_{date_subfolder}.xlsx")
             
             # Se já foi baixado anteriormente
@@ -382,96 +359,114 @@ def main():
                 print(f"  ➜ {op_label.upper()} já existe localmente. Pulando.")
                 continue
                 
-            print(f"  ➜ Obtendo planilha de {op_label.upper()}... ", end="", flush=True)
+            print(f"  ➜ Extraindo dados de {op_label.upper()}... ", end="", flush=True)
             
             # Atualizar token se necessário antes de cada chamada
             access_token, refresh_token = ensure_valid_token(config, access_token, refresh_token, token_url, client_id)
             headers = {
                 'Authorization': f'Bearer {access_token}',
-                'Content-Type': 'application/json',
                 'Accept': 'application/json, text/plain, */*',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
             
-            # 1. Verifica se já existe solicitação pendente ou concluída no SIGA
-            solicitação = get_existing_solicitation(session, headers, cnpj_clean, ref_date, doc_type, operacao)
+            records = []
+            page = 0
+            size = 1000
+            total_pages = 1
+            has_permission = True
             
-            if solicitação:
-                sol_id = solicitação.get("id")
-                sol_status = solicitação.get("status")
-                print(f"encontrada solicitação ativa (ID={sol_id} | Status={sol_status})")
-            else:
-                # 2. Se não existir, faz a requisição POST para gerar o download
-                print("criando nova solicitação... ", end="", flush=True)
-                post_url = f"https://siga.sefaz.ce.gov.br/api/v1/unidades/{cnpj_clean}/documentos-fiscais/{api_path}/download"
-                payload = {
-                    "datReferencia": [ref_date],
-                    "tipoOperacao": operacao,
-                    "formatoArquivo": "xlsx"
+            while page < total_pages:
+                api_url = f"https://siga.sefaz.ce.gov.br/api/v1/unidades/{cnpj_clean}/documentos-fiscais/{api_path}"
+                params = {
+                    'size': size,
+                    'page': page,
+                    'sort': 'datEmissao,asc',
+                    'dat-referencia': ref_date,
+                    'tipo-operacao': operacao
                 }
                 
                 try:
-                    r_post = session.post(post_url, headers=headers, json=payload, timeout=20)
-                    if r_post.status_code == 202:
-                        print("criada! ", end="", flush=True)
-                        time.sleep(2)
-                        solicitação = get_existing_solicitation(session, headers, cnpj_clean, ref_date, doc_type, operacao)
-                        if solicitação:
-                            sol_id = solicitação.get("id")
-                            sol_status = solicitação.get("status")
-                        else:
-                            print("⚠️ Erro ao recuperar ID da nova solicitação.")
-                            continue
-                    elif r_post.status_code == 403:
+                    response = session.get(api_url, headers=headers, params=params, timeout=25)
+                    if response.status_code == 401:
+                        # Tenta renovar o token e repetir a chamada
+                        access_token, refresh_token = ensure_valid_token(config, "", refresh_token, token_url, client_id)
+                        headers['Authorization'] = f'Bearer {access_token}'
+                        continue
+                    elif response.status_code == 403:
                         print("❌ Sem procuração de acesso.")
+                        has_permission = False
                         folder_sem = "Sem Procuracao"
                         os.makedirs(folder_sem, exist_ok=True)
                         filepath_sem = os.path.join(folder_sem, f"{company_label}.txt")
                         with open(filepath_sem, "w", encoding="utf-8") as f_sem:
                             f_sem.write(f"Código/Nome: {company_label}\nCNPJ: {cnpj}\nRazão Social: {razao_social}\nStatus: Sem procuração de acesso cadastrada na SEFAZ para este usuário.")
-                        break # Pula esta empresa para as demais operações
-                    elif r_post.status_code == 409:
-                        time.sleep(1)
-                        solicitação = get_existing_solicitation(session, headers, cnpj_clean, ref_date, doc_type, operacao)
-                        if solicitação:
-                            sol_id = solicitação.get("id")
-                            sol_status = solicitação.get("status")
-                            print(f"recuperada após conflito (ID={sol_id})")
-                        else:
-                            print(f"❌ Conflito (HTTP 409) e falha ao obter ID.")
-                            continue
-                    else:
-                        print(f"❌ Erro HTTP ao criar ({r_post.status_code})")
-                        continue
+                        break
+                    elif response.status_code != 200:
+                        print(f"❌ Erro HTTP {response.status_code} ao buscar dados.")
+                        break
+                        
+                    data = response.json()
+                    content = data.get("data", []) if isinstance(data, dict) else []
+                    if not content:
+                        break
+                        
+                    records.extend(content)
+                    
+                    if isinstance(data, dict) and "totalPages" in data:
+                        total_pages = data["totalPages"]
+                    
+                    page += 1
                 except Exception as e:
-                    print(f"❌ Erro na requisição POST: {e}")
-                    continue
-            
-            # 3. Monitoramento do status e Download
-            concluido = False
-            for tentativa in range(12): # Monitora por até 60 segundos por arquivo
-                if sol_status == "CONCLUIDO":
-                    concluido = True
+                    print(f"❌ Erro ao consultar API: {e}")
                     break
-                elif sol_status in ["ERRO", "FALHA"]:
-                    print(f"    ❌ Solicitação falhou no processamento da SEFAZ (Status={sol_status})")
-                    break
+                    
+            if not has_permission:
+                break # Pula para a próxima empresa
                 
-                print(".", end="", flush=True)
-                time.sleep(5)
+            if not records:
+                print("Nenhum registro encontrado.")
+                continue
                 
-                solicitação = get_existing_solicitation(session, headers, cnpj_clean, ref_date, doc_type, operacao)
-                if solicitação:
-                    sol_status = solicitação.get("status")
-            
-            if concluido:
-                print(" baixando planilha... ", end="", flush=True)
-                if download_file(session, headers, sol_id, filepath):
-                    print("✅ Sucesso!")
+            # Compilar os dados em uma planilha Excel usando openpyxl
+            try:
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = op_label.upper()[:30] # Excel limita título a 30 caracteres
+                
+                # Definir cabeçalhos idênticos aos da SEFAZ
+                if operacao == "SAIDA":
+                    headers_row = ["CNPJ destinatário", "Razão social destinatário", "UF", "Número da nota", "Data de emissão", "Indicadores selecionados", "Valor R$ ", "Chave NF-e"]
                 else:
-                    print("❌ Falha no download (talvez o arquivo esteja vazio ou indisponível).")
-            else:
-                print(" ⏳ Tempo esgotado (ainda processando na SEFAZ). Tente rodar o script novamente mais tarde.")
+                    headers_row = ["CNPJ emitente", "Razão social emitente", "UF", "Número da nota", "Data de emissão", "Indicadores selecionados", "Valor R$ ", "Chave NF-e"]
+                    
+                ws.append(headers_row)
+                
+                for item in records:
+                    contribuinte = item.get("contribuinteEnvolvido") or {}
+                    cnpj_env = contribuinte.get("cnpj", "")
+                    razao_env = contribuinte.get("razaoSocial", "")
+                    uf_env = contribuinte.get("uf", "")
+                    numero = item.get("numDocumentoFiscal", "")
+                    
+                    # Formatar data de emissão para DD/MM/YYYY
+                    dat_emissao = item.get("datEmissao", "")
+                    if dat_emissao and "T" in dat_emissao:
+                        dat_emissao = dat_emissao.split("T")[0]
+                        parts = dat_emissao.split("-")
+                        if len(parts) == 3:
+                            dat_emissao = f"{parts[2]}/{parts[1]}/{parts[0]}"
+                            
+                    status_proc = item.get("resultadoProcessamento", "")
+                    valor = item.get("vlrDocumento", 0.0)
+                    chave = item.get("chaveAcesso", "")
+                    
+                    ws.append([cnpj_env, razao_env, uf_env, numero, dat_emissao, status_proc, valor, chave])
+                    
+                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                wb.save(filepath)
+                print(f"✅ Sucesso! ({len(records)} registros salvos em Excel)")
+            except Exception as e:
+                print(f"❌ Erro ao gerar Excel: {e}")
                 
     print("\n🎉 Processamento concluído!")
 

@@ -4,11 +4,14 @@
 SIGA SEFAZ-CE - Extrator Completo de NFC-e e Compilador de XMLs (Threads e ZIP)
 
 Este script unifica o fluxo:
-1. Coleta as chaves de acesso detalhadas das NFC-e no SIGA para o mês selecionado.
-2. Associa com códigos internos da planilha 'empresas cod.xlsx'.
-3. Realiza o download multithread (40 threads) dos XMLs fiscais da SEFAZ.
-4. Limpa namespaces dos XMLs e organiza em pastas 'EMPRESA-/MMAAAA/'.
-5. Compacta os XMLs em arquivos ZIP separados por empresa.
+1. Carrega histórico de chaves já cadastradas no banco a partir de 'chaves_ja_cadastradas.csv' (somente leitura).
+2. Coleta as chaves de acesso detalhadas das NFC-e no SIGA para o mês/ano selecionado.
+3. Filtra documentos cancelados conforme configuração individual de cada empresa.
+4. Descarta chaves que já constem no CSV de chaves cadastradas para aquele CNPJ.
+5. Associa com códigos internos da planilha 'empresas cod.xlsx'.
+6. Realiza o download multithread (40 threads) dos XMLs fiscais pendentes da SEFAZ em lotes de até 4.000.
+7. Limpa namespaces dos XMLs e organiza em pastas 'EMPRESA-/MMAAAA/NFCe_Parte_X/'.
+8. Registra as chaves processadas nesta execução em 'chaves_baixadas_nesta_execucao.csv'.
 """
 
 import os
@@ -19,10 +22,16 @@ import base64
 import csv
 import re
 import threading
-import zipfile
 import xml.etree.ElementTree as ET
 import requests
 import urllib3
+
+# Garante compatibilidade de caracteres especiais/emojis no console Windows
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 # Ocultar avisos de SSL (InsecureRequestWarning) já que a chamada usa verify=False
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -39,9 +48,11 @@ CONFIG_FILE = "config.json"
 EXCEL_FILE = "empresas cod.xlsx"
 COMPANIES_CSV = "siga_empresas.csv"
 TOKEN_FILE = "api_token.txt"
+CSV_JA_CADASTRADAS = "chaves_ja_cadastradas.csv"
+CSV_EXECUCAO = "chaves_baixadas_nesta_execucao.csv"
 
 def load_config():
-    """Carrega as credenciais em cache."""
+    """Carrega as credenciais e configurações em cache."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -51,7 +62,7 @@ def load_config():
     return {}
 
 def save_config(config):
-    """Grava as credenciais em cache."""
+    """Grava as credenciais e configurações em cache."""
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
@@ -140,13 +151,37 @@ def clean_input_val(val):
     if not val:
         return ""
     val = val.strip()
-    # Se o usuário colou a linha inteira do JSON: "access_token": "ey..."
     if ":" in val:
         parts = val.split(":", 1)
         val = parts[1].strip()
-    # Remove aspas extras, vírgulas e espaços
     val = val.strip(" \t\n\r\"',;")
     return val
+
+def clean_cnpj(cnpj):
+    """Remove formatação do CNPJ e retorna apenas dígitos numéricos (normalizado para 14 dígitos)."""
+    if not cnpj:
+        return ""
+    digits = "".join(filter(str.isdigit, str(cnpj)))
+    if len(digits) <= 14 and len(digits) >= 8:
+        return digits.zfill(14)
+    return digits
+
+def format_cnpj(cnpj):
+    """Formata CNPJ no padrão 00.000.000/0000-00."""
+    c = clean_cnpj(cnpj)
+    if len(c) == 14:
+        return f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}"
+    return str(cnpj)
+
+def clean_chave(chave):
+    """Remove qualquer caractere não numérico e retorna a chave com 44 dígitos."""
+    if not chave:
+        return ""
+    return "".join(filter(str.isdigit, str(chave)))
+
+def format_num(n):
+    """Formata número com separador de milhar brasileiro (ponto)."""
+    return f"{n:,}".replace(",", ".")
 
 def ensure_valid_token(config, access_token, refresh_token, token_url, client_id):
     """Garante que o token de acesso seja válido, renovando se necessário ou pedindo novas credenciais."""
@@ -164,7 +199,6 @@ def ensure_valid_token(config, access_token, refresh_token, token_url, client_id
             print("Renovado!")
             return access_token, refresh_token
             
-    # Se falhou a renovação automatizada, pede ao usuário
     print("\n⚠️ O Refresh Token expirou ou é inválido (erro ao renovar).")
     print("Por favor, obtenha novos tokens na aba Network (F12) do SIGA.")
     while True:
@@ -199,7 +233,6 @@ def load_excel_mapping(filepath):
         print("❌ A planilha Excel está vazia.")
         sys.exit(1)
         
-    # Mapeia colunas dinamicamente
     headers = [str(h).strip().lower() for h in rows[0] if h is not None]
     code_idx = 0
     name_idx = 1
@@ -238,11 +271,107 @@ def find_company_code(razao_social, mapping):
                 
     return "", ""
 
+def escanear_xmls_locais(pasta_base="siga_nfce"):
+    """Varre a pasta local procurando XMLs já salvos no disco."""
+    chaves_locais = {}
+    if not os.path.exists(pasta_base):
+        return chaves_locais
+    for root, _, files in os.walk(pasta_base):
+        for name in files:
+            if name.lower().endswith(".xml"):
+                chave = clean_chave(name[:-4])
+                if len(chave) == 44:
+                    cnpj = clean_cnpj(chave[6:20])
+                    if cnpj not in chaves_locais:
+                        chaves_locais[cnpj] = set()
+                    chaves_locais[cnpj].add(chave)
+    return chaves_locais
+
+def carregar_chaves_ja_cadastradas(filepath=CSV_JA_CADASTRADAS):
+    """
+    Carrega o arquivo CSV de chaves já cadastradas no banco de dados.
+    Este arquivo é utilizado EXCLUSIVAMENTE em modo de LEITURA e NUNCA é modificado pelo código.
+    
+    Retorna uma estrutura de indexação em memória: dict[CNPJ_limpo, set[CHAVE_limpa]].
+    Suporta:
+      - Arquivos com colunas (CNPJ, CHAVE) ou (CHAVE, CNPJ)
+      - Qualquer delimitador (vírgula, ponto-e-vírgula, tabulação, barra vertical)
+      - CNPJs com ou sem pontuação (normalizados para 14 dígitos numéricos)
+      - Chaves com ou sem formatação (normalizadas para 44 dígitos numéricos)
+      - Linhas contendo apenas a CHAVE (extrai o CNPJ dos dígitos 6 a 19 da chave de 44 dígitos)
+    """
+    chaves_por_cnpj = {}
+    total_carregadas = 0
+    
+    # Se o arquivo principal não existir mas o legado existir, usa como fallback
+    target_file = filepath
+    if not os.path.exists(target_file) and os.path.exists("chaves_ja_baixadas.csv"):
+        target_file = "chaves_ja_baixadas.csv"
+        
+    if os.path.exists(target_file) and os.path.getsize(target_file) > 0:
+        print(f"📖 Carregando chaves cadastradas de '{target_file}' (somente leitura)...")
+        try:
+            with open(target_file, mode="r", encoding="utf-8-sig") as f:
+                for line_num, line in enumerate(f, 1):
+                    raw_line = line.strip()
+                    if not raw_line:
+                        continue
+                    # Se for linha de cabeçalho
+                    if line_num <= 3 and ("cnpj" in raw_line.lower() or "chave" in raw_line.lower()):
+                        digitos = "".join(filter(str.isdigit, raw_line))
+                        if len(digitos) < 20:
+                            continue
+                            
+                    partes = re.split(r'[,;\t|\s]+', raw_line)
+                    c_cnpj = ""
+                    c_chave = ""
+                    
+                    for p in partes:
+                        digits = "".join(filter(str.isdigit, p))
+                        if len(digits) == 44 and not c_chave:
+                            c_chave = digits
+                        elif (8 <= len(digits) <= 14) and not c_cnpj:
+                            c_cnpj = clean_cnpj(digits)
+                            
+                    if c_chave and len(c_chave) == 44:
+                        if not c_cnpj:
+                            c_cnpj = clean_cnpj(c_chave[6:20])
+                            
+                        if c_cnpj not in chaves_por_cnpj:
+                            chaves_por_cnpj[c_cnpj] = set()
+                        chaves_por_cnpj[c_cnpj].add(c_chave)
+                        total_carregadas += 1
+                        
+            print(f"✅ Chaves carregadas do CSV: {format_num(total_carregadas)} chaves em {len(chaves_por_cnpj)} CNPJ(s).\n")
+        except Exception as e:
+            print(f"⚠️ Erro ao ler '{target_file}': {e}\n")
+    else:
+        print(f"ℹ️ Arquivo '{filepath}' não encontrado ou vazio. Nenhuma chave pré-cadastrada carregada.\n")
+        
+    return chaves_por_cnpj
+
+def registrar_execucao(registros, filepath=CSV_EXECUCAO):
+    """
+    Registra as chaves processadas nesta execução em arquivo CSV para auditoria.
+    registros: lista de tuplas (cnpj, chave, status)
+    """
+    deve_escrever_cabecalho = not os.path.exists(filepath) or os.path.getsize(filepath) == 0
+    try:
+        with open(filepath, mode="a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f, delimiter=";")
+            if deve_escrever_cabecalho:
+                writer.writerow(["CNPJ", "CHAVE", "STATUS", "DATA_HORA"])
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            for cnpj, chave, status in registros:
+                writer.writerow([clean_cnpj(cnpj), clean_chave(chave), status, timestamp])
+    except Exception as e:
+        print(f"⚠️ Erro ao gravar em '{filepath}': {e}")
+
 # ====================================================
 # =============== Função de download =================
 # ====================================================
 
-def processar_lote_xml(lote, api_token, thread_id):
+def processar_lote_xml(lote, api_token, thread_id, stats_lock=None, stats=None, registros_lock=None, registros_execucao=None, cnpj_clean=""):
     """Processa um lote de chaves fazendo o download dos XMLs e limpando namespaces."""
     total = len(lote)
     count = 0
@@ -250,44 +379,68 @@ def processar_lote_xml(lote, api_token, thread_id):
     session = requests.Session()
     
     for task in lote:
-        chave, company_label, date_subfolder = task
-        folder = os.path.join("siga_nfce", f"{company_label}-", date_subfolder)
+        chave, folder = task
         filepath = os.path.join(folder, f"{chave}.xml")
         
         # Ignora se já foi baixado anteriormente
         if os.path.exists(filepath):
             count += 1
+            if stats_lock and stats is not None:
+                with stats_lock:
+                    stats["baixados"] += 1
+            if registros_lock and registros_execucao is not None:
+                with registros_lock:
+                    registros_execucao.append((cnpj_clean, chave, "SUCESSO"))
             continue
             
         time.sleep(0.5)  # Atraso de cortesia exigido pela API
         
         try:
             # 1. Obter o ID da NFC-e
-            link_id = f'https://cfe.sefaz.ce.gov.br:8443/portalcfews/nfce/coupons/extract/{str(chave).replace(" ", "")}?apiKey={api_token}'
+            clean_chave_str = clean_chave(chave)
+            link_id = f'https://cfe.sefaz.ce.gov.br:8443/portalcfews/nfce/coupons/extract/{clean_chave_str}?apiKey={api_token}'
             r_id = session.get(link_id, verify=False, timeout=20)
             
             if r_id.status_code != 200:
                 print(f"❌ [Thread {thread_id}] Erro ao buscar ID da chave {chave} (HTTP {r_id.status_code})")
+                if stats_lock and stats is not None:
+                    with stats_lock:
+                        stats["falhas"] += 1
+                if registros_lock and registros_execucao is not None:
+                    with registros_lock:
+                        registros_execucao.append((cnpj_clean, chave, "ERRO"))
                 continue
                 
             res_json = r_id.json()
             id_nfe = res_json.get('idNfe')
             if not id_nfe:
                 print(f"❌ [Thread {thread_id}] ID NFe não encontrado no retorno da chave {chave}")
+                if stats_lock and stats is not None:
+                    with stats_lock:
+                        stats["falhas"] += 1
+                if registros_lock and registros_execucao is not None:
+                    with registros_lock:
+                        registros_execucao.append((cnpj_clean, chave, "ERRO"))
                 continue
                 
             # 2. Baixar o XML fiscal
-            link_xml = f'https://cfe.sefaz.ce.gov.br:8443/portalcfews/nfce/fiscal-coupons/xml/{id_nfe}?chaveAcesso={str(chave).replace(" ", "")}&apiKey={api_token}'
+            link_xml = f'https://cfe.sefaz.ce.gov.br:8443/portalcfews/nfce/fiscal-coupons/xml/{id_nfe}?chaveAcesso={clean_chave_str}&apiKey={api_token}'
             r_xml = session.get(link_xml, verify=False, timeout=20)
             
             if r_xml.status_code != 200:
                 print(f"❌ [Thread {thread_id}] Erro ao baixar XML da chave {chave} (HTTP {r_xml.status_code})")
+                if stats_lock and stats is not None:
+                    with stats_lock:
+                        stats["falhas"] += 1
+                if registros_lock and registros_execucao is not None:
+                    with registros_lock:
+                        registros_execucao.append((cnpj_clean, chave, "ERRO"))
                 continue
                 
-            # 3. Limpar namespaces do XML (mantendo compatibilidade com seu código original)
+            # 3. Limpar namespaces do XML
             xml_data = r_xml.content.decode('utf-8')
-            xml_data = re.sub(r'\sxmlns(:\w+)?="[^"]+"', '', xml_data)  # remove declarações xmlns
-            xml_data = re.sub(r'(<\/?)(\w+:)', r'\1', xml_data)  # remove prefixos de namespace
+            xml_data = re.sub(r'\sxmlns(:\w+)?="[^"]+"', '', xml_data)
+            xml_data = re.sub(r'(<\/?)(\w+:)', r'\1', xml_data)
             
             root = ET.fromstring(xml_data)
             tree = ET.ElementTree(root)
@@ -298,11 +451,23 @@ def processar_lote_xml(lote, api_token, thread_id):
             r_xml.close()
             
             count += 1
+            if stats_lock and stats is not None:
+                with stats_lock:
+                    stats["baixados"] += 1
+            if registros_lock and registros_execucao is not None:
+                with registros_lock:
+                    registros_execucao.append((cnpj_clean, chave, "SUCESSO"))
             percent = (count / total) * 100
             print(f"[Thread {thread_id}] {percent:.2f}% concluído - Faltam {total - count}")
             
         except Exception as e:
             print(f"❌ [Thread {thread_id}] Erro inesperado na chave {chave}: {e}")
+            if stats_lock and stats is not None:
+                with stats_lock:
+                    stats["falhas"] += 1
+            if registros_lock and registros_execucao is not None:
+                with registros_lock:
+                    registros_execucao.append((cnpj_clean, chave, "ERRO"))
 
 # ====================================================
 # ============== Código principal ====================
@@ -325,7 +490,7 @@ def main():
         for row in reader:
             siga_companies.append(row)
             
-    print(f"✅ Carregadas {len(siga_companies)} empresas do arquivo '{COMPANIES_CSV}'.")
+    print(f" Carregadas {len(siga_companies)} empresas do arquivo '{COMPANIES_CSV}'.")
     
     # 2. Carregar de-para de códigos da planilha Excel
     excel_mapping = load_excel_mapping(EXCEL_FILE)
@@ -334,7 +499,7 @@ def main():
     api_token = load_api_token()
     if not api_token:
         print("\nChave da API SEFAZ CFe ausente.")
-        api_token = input("Cole a sua apiKey da SEFAZ Ceará: ").strip()
+        api_token = clean_input_val(input("Cole a sua apiKey da SEFAZ Ceará: "))
         save_api_token(api_token)
     else:
         print("ℹ️ Token da API SEFAZ carregado com sucesso do api_token.txt.")
@@ -345,6 +510,23 @@ def main():
     refresh_token = config.get("refresh_token")
     client_id = config.get("client_id") or "painelind-frontend"
     token_url = config.get("token_url") or "https://sso.sefaz.ce.gov.br/auth/realms/sefaz-ad-realm/protocol/openid-connect/token"
+    
+    # Pergunta se deseja trocar os tokens do SIGA
+    if access_token and refresh_token and not is_token_expired(refresh_token):
+        trocar_siga = input("Deseja trocar os tokens de login/F12 do SIGA (access_token/refresh_token)? (s/N): ").strip().lower()
+        if trocar_siga in ['s', 'sim']:
+            print("\n⚠️ Atenção: Os tokens do SIGA são códigos longos (JWT) obtidos na aba Network (F12), NÃO são CNPJs.")
+            novo_acc = clean_input_val(input("Cole o novo access_token (longo): "))
+            if len(novo_acc) < 50:
+                print("⚠️ O access_token colado é muito curto ou inválido. Mantendo o token atual.")
+            else:
+                novo_ref = clean_input_val(input("Cole o novo refresh_token (longo): "))
+                if novo_acc and novo_ref:
+                    access_token = novo_acc
+                    refresh_token = novo_ref
+                    config.update({"access_token": access_token, "refresh_token": refresh_token})
+                    save_config(config)
+                    print("✅ Tokens do SIGA atualizados com sucesso no config.json!")
     
     # Se os tokens não existem, ou se o refresh_token já expirou, solicita novos tokens
     if not access_token or not refresh_token or is_token_expired(refresh_token):
@@ -370,57 +552,107 @@ def main():
     mes_str = f"{mes_num:02d}"
     date_subfolder = f"{mes_str}{ano}"
     
-    print(f"\n📅 Período de consulta: Mês {target_month_name if 'target_month_name' in locals() else mes_str}/{ano}")
+    print(f"\n📅 Período de consulta: Mês {mes_str}/{ano}")
     
-    # 5.1. Perguntar se deseja processar empresas específicas
-    opcao_empresa = input("\nDeseja puxar dados de alguma empresa específica? (s/N): ").strip().lower()
-    if opcao_empresa in ['s', 'sim']:
-        cnpjs_input = input("Digite ou cole os CNPJs das empresas: ").strip()
-        
-        # Extrai CNPJs usando regex para suportar formatos colados, separados por vírgula, espaços, etc.
-        cnpjs_encontrados = re.findall(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{14}|\d{8}', cnpjs_input)
-        cnpjs_filtrar = []
-        for c in cnpjs_encontrados:
-            c_clean = "".join(filter(str.isdigit, c))
-            if c_clean:
-                cnpjs_filtrar.append(c_clean)
-        
-        if cnpjs_filtrar:
-            filtradas = []
-            for comp in siga_companies:
-                cnpj_comp = "".join(filter(str.isdigit, comp.get("cnpj", "")))
-                # Compara se o CNPJ filtrado é um subconjunto ou igual ao CNPJ da empresa
-                if any(f in cnpj_comp for f in cnpjs_filtrar):
-                    filtradas.append(comp)
+    # 6. Carregar histórico de chaves já existentes no banco (CSV - Somente Leitura)
+    chaves_por_cnpj = carregar_chaves_ja_cadastradas(CSV_JA_CADASTRADAS)
+    
+    # 7. Selecionar empresas e configurar tratamento de canceladas
+    mapa_siga = {}
+    for comp in siga_companies:
+        c_clean = clean_cnpj(comp.get("cnpj", ""))
+        if c_clean:
+            mapa_siga[c_clean] = comp
             
-            if filtradas:
-                siga_companies = filtradas
-                print(f"🎯 Filtrado! {len(siga_companies)} empresa(s) selecionada(s) para processar.")
+    empresas_alvo = []
+    
+    # Verifica se há lista pré-configurada no config.json
+    config_empresas = config.get("empresas_nfc", [])
+    if config_empresas:
+        print(f"\nℹ️ Encontradas {len(config_empresas)} empresas configuradas no config.json:")
+        for idx_e, emp_cfg in enumerate(config_empresas, 1):
+            emp_cnpj = clean_cnpj(emp_cfg.get("cnpj", ""))
+            emp_canc = emp_cfg.get("processar_canceladas", False)
+            canc_txt = "SIM" if emp_canc else "NÃO"
+            print(f"  {idx_e}. CNPJ: {format_cnpj(emp_cnpj)} (Processar canceladas: {canc_txt})")
+            
+        usar_cfg = input("\nDeseja processar as empresas configuradas no config.json? (S/n): ").strip().lower()
+        if usar_cfg not in ['n', 'nao', 'não']:
+            for emp_cfg in config_empresas:
+                c_clean = clean_cnpj(emp_cfg.get("cnpj", ""))
+                if c_clean:
+                    emp_info = mapa_siga.get(c_clean, {"cnpj": c_clean, "razaoSocial": "", "cgf": ""})
+                    empresas_alvo.append({
+                        "cnpj": c_clean,
+                        "razaoSocial": emp_info.get("razaoSocial", ""),
+                        "cgf": emp_info.get("cgf", ""),
+                        "processar_canceladas": emp_cfg.get("processar_canceladas", False)
+                    })
+                    
+    if not empresas_alvo:
+        opcao_empresa = input("\nDeseja puxar dados de alguma empresa específica? (s/N): ").strip().lower()
+        if opcao_empresa in ['s', 'sim']:
+            cnpjs_input = input("Digite ou cole os CNPJs das empresas: ").strip()
+            cnpjs_encontrados = re.findall(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{14}|\d{8}', cnpjs_input)
+            cnpjs_filtrar = []
+            for c in cnpjs_encontrados:
+                c_clean = clean_cnpj(c)
+                if c_clean and c_clean not in cnpjs_filtrar:
+                    cnpjs_filtrar.append(c_clean)
+            
+            if cnpjs_filtrar:
+                for c_clean in cnpjs_filtrar:
+                    emp_info = mapa_siga.get(c_clean, {"cnpj": c_clean, "razaoSocial": "", "cgf": ""})
+                    # Pergunta ou usa False por padrão para canceladas
+                    empresas_alvo.append({
+                        "cnpj": c_clean,
+                        "razaoSocial": emp_info.get("razaoSocial", ""),
+                        "cgf": emp_info.get("cgf", ""),
+                        "processar_canceladas": False
+                    })
+                print(f"🎯 Total: {len(empresas_alvo)} empresa(s) selecionada(s) para processar.")
             else:
-                print("⚠️ Nenhuma empresa correspondente encontrada com os CNPJs fornecidos. Usando a lista completa.")
-        else:
-            print("⚠️ Nenhum CNPJ válido identificado no texto digitado. Usando a lista completa.")
-            
-    # 6. Loop de extração de chaves do SIGA
-    xml_tasks = []
+                print("⚠️ Nenhum CNPJ válido identificado. Usando todas as empresas salvas.")
+                
+        if not empresas_alvo:
+            for comp in siga_companies:
+                c_clean = clean_cnpj(comp.get("cnpj", ""))
+                if c_clean:
+                    empresas_alvo.append({
+                        "cnpj": c_clean,
+                        "razaoSocial": comp.get("razaoSocial", ""),
+                        "cgf": comp.get("cgf", ""),
+                        "processar_canceladas": False
+                    })
+                    
+    # 8. Execução e download por CNPJ
     session = requests.Session()
+    resumo_empresas = []
     
-    print(f"\n🔎 Buscando chaves de acesso no painel do SIGA...")
-    
-    for idx, comp in enumerate(siga_companies):
-        cnpj = comp.get("cnpj", "").strip()
-        razao_social = comp.get("razaoSocial", "").strip()
-        cgf = comp.get("cgf", "").strip()
-        cnpj_clean = "".join(filter(str.isdigit, cnpj))
+    for emp in empresas_alvo:
+        cnpj_clean = emp["cnpj"]
+        razao_social = emp.get("razaoSocial", "")
+        cgf = emp.get("cgf", "")
+        processar_canceladas = emp.get("processar_canceladas", False)
         
-        if not cnpj_clean:
-            continue
-            
-        cod_excel, nome_excel = find_company_code(razao_social, excel_mapping)
-        company_label = f"{cod_excel} - {nome_excel}" if cod_excel else f"{cnpj_clean} - {razao_social}"
+        cod_excel, nome_excel = find_company_code(razao_social, excel_mapping) if razao_social else ("", "")
+        if cod_excel:
+            company_label = f"{cod_excel} - {nome_excel}"
+        elif razao_social:
+            company_label = f"{cnpj_clean} - {razao_social}"
+        else:
+            company_label = f"{cnpj_clean}"
         company_label = sanitize_filename(company_label)
         
-        print(f"⏳ [{idx+1}/{len(siga_companies)}] Coletando chaves: {company_label[:35]}... ", end="", flush=True)
+        print("\n" + "=" * 50)
+        print(f"PROCESSANDO: {format_cnpj(cnpj_clean)}")
+        if company_label:
+            print(f"Empresa: {company_label}")
+        if processar_canceladas:
+            print("Processar canceladas: SIM")
+        print("=" * 50)
+        
+        print(f"\n🔍 Consultando listagem de notas no SIGA ({mes_str}/{ano})...")
         
         company_nfc_keys = []
         page = 0
@@ -432,7 +664,6 @@ def main():
             # Renovar token SIGA se necessário
             access_token, refresh_token = ensure_valid_token(config, access_token, refresh_token, token_url, client_id)
                     
-            # Chamada da API detalhada de NFC-e do SIGA
             api_url = f"https://siga.sefaz.ce.gov.br/api/v1/unidades/{cnpj_clean}/documentos-fiscais/nfc-e"
             headers = {
                 'Authorization': f'Bearer {access_token}',
@@ -453,11 +684,10 @@ def main():
                 response = session.get(api_url, headers=headers, params=params, timeout=25)
                 
                 if response.status_code == 401:
-                    print("\n🔄 Erro 401 (Não Autorizado). Forçando renovação emergencial...")
+                    print("\n⚠️ Erro 401 (Não Autorizado). Forçando renovação emergencial...")
                     access_token, refresh_token = ensure_valid_token(config, "", refresh_token, token_url, client_id)
                     continue
                 
-                # Se der 403, significa que não temos procuração de acesso para esta empresa
                 if response.status_code == 403:
                     sem_procuracao_detected = True
                     break
@@ -480,8 +710,18 @@ def main():
                 else:
                     for item in content:
                         chave = item.get("chaveAcesso") or item.get("chave")
+                        situacao = str(item.get("situacao") or item.get("status") or "").upper()
+                        is_cancelada = "CANCELAD" in situacao or item.get("cancelada") is True
+                        
+                        if not processar_canceladas and is_cancelada:
+                            continue
+                            
                         if chave:
-                            company_nfc_keys.append(chave)
+                            c_chave = clean_chave(chave)
+                            if len(c_chave) == 44:
+                                company_nfc_keys.append(c_chave)
+                    
+                    print(f"  → Página {page + 1}: {len(company_nfc_keys)} chaves localizadas no SIGA...", end="\r")
                     
                     if len(content) < size:
                         has_more = False
@@ -494,57 +734,153 @@ def main():
                 break
                 
         if sem_procuracao_detected:
-            print("❌ Sem procuração! (Adicionado na pasta 'Sem Procuracao')")
-            # Salvar o aviso numa pasta diferente
+            print("❌ Sem procuração de acesso! (Registrado em 'Sem Procuracao')")
             folder_sem = os.path.join("siga_nfce", "Sem Procuracao")
             os.makedirs(folder_sem, exist_ok=True)
             filepath_sem = os.path.join(folder_sem, f"{company_label}.txt")
             with open(filepath_sem, "w", encoding="utf-8") as f_sem:
-                f_sem.write(f"Código/Nome: {company_label}\nCNPJ: {cnpj}\nCGF: {cgf}\nRazão Social: {razao_social}\nStatus: Sem procuração de acesso cadastrada na SEFAZ para este usuário.")
+                f_sem.write(f"Código/Nome: {company_label}\nCNPJ: {cnpj_clean}\nCGF: {cgf}\nRazão Social: {razao_social}\nStatus: Sem procuração de acesso cadastrada na SEFAZ para este usuário.")
+            resumo_empresas.append({
+                "cnpj": cnpj_clean,
+                "siga": 0,
+                "existentes": 0,
+                "pendentes": 0,
+                "baixadas": 0,
+                "falhas": 0,
+                "status": "Sem Procuração"
+            })
             continue
             
-        print(f"OK! ({len(company_nfc_keys)} chaves)")
+        # Deduplicação mantendo ordem original
+        chaves_siga = list(dict.fromkeys(company_nfc_keys))
+        duplicadas_removidas = len(company_nfc_keys) - len(chaves_siga)
         
-        # Adicionar as chaves na lista de downloads
-        for k in company_nfc_keys:
-            xml_tasks.append((k, company_label, date_subfolder))
+        print(f"\nChaves encontradas na API: {format_num(len(chaves_siga))}")
+        if duplicadas_removidas > 0:
+            print(f"   (Chaves duplicadas na API ignoradas: {format_num(duplicadas_removidas)})")
+        
+        # Comparação com chaves_ja_cadastradas.csv
+        print(f"\nComparando com {CSV_JA_CADASTRADAS}...")
+        
+        # Busca no arquivo SOMENTE as chaves relacionadas a esse CNPJ específico
+        chaves_cadastradas_cnpj = chaves_por_cnpj.get(cnpj_clean, set())
+        
+        # Identifica chaves cadastradas e pendentes para este CNPJ
+        chaves_ignoradas = [k for k in chaves_siga if k in chaves_cadastradas_cnpj]
+        chaves_pendentes = [k for k in chaves_siga if k not in chaves_cadastradas_cnpj]
+        
+        print(f"\nChaves já cadastradas: {format_num(len(chaves_ignoradas))}")
+        print(f"Chaves ignoradas: {format_num(len(chaves_ignoradas))}")
+        print(f"Chaves pendentes: {format_num(len(chaves_pendentes))}")
+        
+        if not chaves_pendentes:
+            print("\nTodas as chaves desse CNPJ já estão cadastradas.")
+            print("Nenhum download necessário.")
+            resumo_empresas.append({
+                "cnpj": cnpj_clean,
+                "siga": len(chaves_siga),
+                "existentes": len(chaves_ignoradas),
+                "pendentes": 0,
+                "baixadas": 0,
+                "falhas": 0,
+                "status": "OK"
+            })
+            continue
             
-    # 7. Filtro de XMLs faltantes
-    baixados = []
-    print("\n🔍 Escaneando diretórios locais para verificar arquivos já baixados...")
-    if os.path.exists("siga_nfce"):
-        for root, dirs, files in os.walk("siga_nfce"):
-            for name in files:
-                if name.endswith(".xml"):
-                    baixados.append(name.replace(".xml", ""))
+        print(f"\nBaixando somente as {format_num(len(chaves_pendentes))} chaves pendentes...")
+        
+        # Divisão em lotes de até 4.000
+        TAMANHO_LOTE = 4000
+        lotes = [chaves_pendentes[i:i + TAMANHO_LOTE] for i in range(0, len(chaves_pendentes), TAMANHO_LOTE)]
+        total_lotes = len(lotes)
+        
+        print(f"\nTotal de lotes: {total_lotes}")
+        for l_i, l_c in enumerate(lotes, 1):
+            print(f"Parte {l_i} → {format_num(len(l_c))}")
                 
-    print(f"ℹ️ Total de XMLs locais identificados: {len(baixados)}")
-    
-    # Filtrar chaves pendentes
-    tarefas_faltando = [t for t in xml_tasks if t[0] not in baixados]
-    print(f"ℹ️ Total de XMLs pendentes de download: {len(tarefas_faltando)}")
-    
-    if not tarefas_faltando:
-        print("\n🎉 Excelente! Todos os XMLs de todas as empresas para este período já estão baixados.")
-        return
+        baixados_empresa = 0
+        falhas_empresa = 0
         
-    # 8. Download multithread de XMLs (divisão em 40 threads)
-    num_threads = min(40, len(tarefas_faltando))
-    partes = [tarefas_faltando[i::num_threads] for i in range(num_threads)]
-    
-    print(f"\n⚡ Iniciando download de {len(tarefas_faltando)} XMLs divididos em {num_threads} threads...")
-    
-    threads = []
-    for idx, parte in enumerate(partes):
-        if parte:
-            t = threading.Thread(target=processar_lote_xml, args=(parte, api_token, idx+1))
-            t.start()
-            threads.append(t)
+        for lote_idx, chaves_lote in enumerate(lotes, 1):
+            pasta_nome = f"NFCe_Parte_{lote_idx}"
+            folder = os.path.join("siga_nfce", f"{company_label}-", date_subfolder, pasta_nome)
             
-    for t in threads:
-        t.join()
+            print(f"\nLote {lote_idx}/{total_lotes}")
+            print(f"Chaves: {format_num(len(chaves_lote))}")
+            print(f"Pasta: {pasta_nome}\n")
+            print("Iniciando downloads...")
+            
+            tasks_lote = [(chave, folder) for chave in chaves_lote]
+            num_threads = min(40, len(tasks_lote))
+            partes = [tasks_lote[i::num_threads] for i in range(num_threads)]
+            
+            stats_lock = threading.Lock()
+            stats = {"baixados": 0, "falhas": 0}
+            registros_lock = threading.Lock()
+            registros_execucao = []
+            
+            threads = []
+            for idx, parte in enumerate(partes):
+                if parte:
+                    t = threading.Thread(
+                        target=processar_lote_xml,
+                        args=(parte, api_token, idx + 1, stats_lock, stats, registros_lock, registros_execucao, cnpj_clean)
+                    )
+                    t.start()
+                    threads.append(t)
+                    
+            for t in threads:
+                t.join()
+                
+            baixados_empresa += stats["baixados"]
+            falhas_empresa += stats["falhas"]
+            registrar_execucao(registros_execucao)
+            
+            print(f"\nLote {lote_idx}/{total_lotes} concluído: {format_num(stats['baixados'])}/{format_num(len(chaves_lote))}")
+            
+        resumo_empresas.append({
+            "cnpj": cnpj_clean,
+            "siga": len(chaves_siga),
+            "existentes": len(chaves_ignoradas),
+            "pendentes": len(chaves_pendentes),
+            "baixadas": baixados_empresa,
+            "falhas": falhas_empresa,
+            "status": "OK"
+        })
         
-    print("\n🎉 Download de XMLs concluído!")
+    # 9. Exibição do Resumo Final
+    print("\n" + "=" * 50)
+    print("RESUMO FINAL")
+    print("=" * 50)
+    
+    total_siga_geral = sum(r["siga"] for r in resumo_empresas)
+    total_existentes_geral = sum(r["existentes"] for r in resumo_empresas)
+    total_pendentes_geral = sum(r["pendentes"] for r in resumo_empresas)
+    total_baixadas_geral = sum(r["baixadas"] for r in resumo_empresas)
+    total_falhas_geral = sum(r["falhas"] for r in resumo_empresas)
+    
+    for idx, r in enumerate(resumo_empresas):
+        print(f"\nCNPJ: {format_cnpj(r['cnpj'])}")
+        if r.get("status") == "Sem Procuração":
+            print("Status: Sem procuração de acesso cadastrada na SEFAZ.")
+        else:
+            print(f"SIGA: {format_num(r['siga'])}")
+            print(f"Já existentes: {format_num(r['existentes'])}")
+            print(f"Pendentes: {format_num(r['pendentes'])}")
+            print(f"Baixadas: {format_num(r['baixadas'])}")
+            if r["falhas"] > 0 or r["pendentes"] > 0:
+                print(f"Falhas: {format_num(r['falhas'])}")
+        if idx < len(resumo_empresas) - 1:
+            print("\n" + "-" * 40)
+            
+    print("\n" + "=" * 50)
+    print("\nTOTAL:\n")
+    print(f"Chaves encontradas no SIGA: {format_num(total_siga_geral)}")
+    print(f"Já existentes no banco/CSV: {format_num(total_existentes_geral)}")
+    print(f"Novas identificadas: {format_num(total_pendentes_geral)}")
+    print(f"Baixadas com sucesso: {format_num(total_baixadas_geral)}")
+    print(f"Falhas: {format_num(total_falhas_geral)}")
+    print("\n" + "=" * 50)
 
 if __name__ == "__main__":
     main()
